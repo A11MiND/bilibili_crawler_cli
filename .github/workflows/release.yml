@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+# Actions are pinned to reviewed immutable SHAs. Dependabot should update both
+# the SHA and the version comment when an upstream release is reviewed.
+jobs:
+  build:
+    name: Validate and build release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify release tag and package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          from bili_comments import __version__ as package_version
+
+          with Path("pyproject.toml").open("rb") as source:
+              project_version = tomllib.load(source)["project"]["version"]
+          release_tag = os.environ["RELEASE_TAG"]
+          expected_tag = f"v{project_version}"
+          if release_tag != expected_tag:
+              raise SystemExit(
+                  f"release tag {release_tag!r} does not equal "
+                  f"expected tag {expected_tag!r}"
+              )
+          if package_version != project_version:
+              raise SystemExit(
+                  f"package version {package_version!r} does not equal "
+                  f"project version {project_version!r}"
+              )
+          print(f"release version verified: {project_version}")
+          PY
+
+      - name: Run offline unit tests
+        env:
+          PYTHONPATH: tests
+          BILI_COOKIE: ""
+        run: python -m unittest discover -s tests -v
+
+      - name: Install build frontend
+        run: python -m pip install --disable-pip-version-check build==1.5.0
+
+      - name: Build wheel and source distribution once
+        run: python -m build
+
+      - name: Audit distribution contents
+        run: python tools/audit_dist.py dist
+
+      - name: Verify installed JSON entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/wheel-smoke"
+          source "$RUNNER_TEMP/wheel-smoke/bin/activate"
+          python -m pip install --disable-pip-version-check --no-deps --no-index \
+            "$GITHUB_WORKSPACE"/dist/*.whl
+          cd "$RUNNER_TEMP/wheel-smoke"
+          bilibili-crawler capabilities --json > primary.json
+          bili-comments capabilities --json > alias.json
+          python -m bili_comments capabilities --json > module.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          paths = [Path("primary.json"), Path("alias.json"), Path("module.json")]
+          payloads = []
+          for path in paths:
+              lines = path.read_text(encoding="utf-8").splitlines()
+              if len(lines) != 1:
+                  raise SystemExit(f"{path}: expected exactly one JSON line")
+              payloads.append(json.loads(lines[0]))
+          if payloads[1:] != payloads[:1] * 2:
+              raise SystemExit("installed JSON entry points returned different payloads")
+          PY
+
+      - name: Upload the single audited release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: ${{ vars.PYPI_PUBLISH == 'true' && github.event.release.prerelease == false }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/bilibili-crawler-cli
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the audited release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-distributions
+          path: dist/
+
+      - name: Publish distributions with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist/

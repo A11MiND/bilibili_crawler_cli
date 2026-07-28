@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilibili-crawler-cli"
+version = "0.3.1"
+description = "Zero-dependency Bilibili comment crawler with CSV export, resume, and agent-friendly JSON"
+readme = { file = "README_CN.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+keywords = ["bilibili", "comments", "crawler", "csv", "cli", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.urls]
+Repository = "https://github.com/A11MiND/bilibili_crawler_cli"
+Issues = "https://github.com/A11MiND/bilibili_crawler_cli/issues"
+Documentation = "https://github.com/A11MiND/bilibili_crawler_cli/blob/main/README_CN.md"
+Changelog = "https://github.com/A11MiND/bilibili_crawler_cli/blob/main/CHANGELOG.md"
+
+[project.scripts]
+bilibili-crawler = "bili_comments.cli:main"
+bili-comments = "bili_comments.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bili_comments*"]
+
+[tool.setuptools.package-data]
+bili_comments = ["skills/*.md"]

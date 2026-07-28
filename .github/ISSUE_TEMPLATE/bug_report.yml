@@ -1,0 +1,79 @@
+name: Bug 报告
+description: 报告可复现的 CLI、数据一致性或兼容性问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先脱敏。不要上传 Cookie、真实 CSV、state、评论、用户 ID、IP 属地、完整 API 响应或本机绝对路径。安全漏洞请使用 Private Vulnerability Reporting，不要创建公开 Issue。
+
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本
+      description: 可从 capabilities 的脱敏结果中取得。
+      placeholder: "0.3.x"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      placeholder: "3.12.x"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - macOS
+        - Linux
+        - WSL
+        - 原生 Windows（当前不支持）
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 脱敏复现步骤
+      description: 使用占位视频标识和相对路径，不粘贴凭据。
+      placeholder: |
+        1. 执行……
+        2. 中断或恢复……
+        3. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 只提供最小、脱敏的错误信息和退出码。
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue，未发现相同问题。
+          required: true
+        - label: 我已移除 Cookie、真实数据、账号信息和本机路径。
+          required: true
+        - label: 此问题不是绕过登录、验证码、限流或访问控制的请求。
+          required: true

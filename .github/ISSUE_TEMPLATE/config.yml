@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私下报告安全漏洞
+    url: https://github.com/A11MiND/bilibili_crawler_cli/security/advisories/new
+    about: Cookie、认证、文件安全或数据完整性漏洞不得公开提交。
+  - name: 使用与边界说明
+    url: https://github.com/A11MiND/bilibili_crawler_cli/blob/main/README_CN.md
+    about: 创建 Issue 前先检查安装、认证、恢复、退出码和已知限制。

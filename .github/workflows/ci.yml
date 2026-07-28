@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to reviewed immutable SHAs. Dependabot should update both
+# the SHA and the version comment when an upstream release is reviewed.
+jobs:
+  unit:
+    name: Unit (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run offline unit tests
+        env:
+          PYTHONPATH: tests
+          BILI_COOKIE: ""
+        run: python -m unittest discover -s tests -v
+
+  package:
+    name: Build and audit distributions
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build frontend
+        run: python -m pip install --disable-pip-version-check build==1.5.0
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Audit distribution contents
+        run: python tools/audit_dist.py dist
+
+      - name: Verify installed JSON entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/wheel-smoke"
+          source "$RUNNER_TEMP/wheel-smoke/bin/activate"
+          python -m pip install --disable-pip-version-check --no-deps --no-index \
+            "$GITHUB_WORKSPACE"/dist/*.whl
+          cd "$RUNNER_TEMP/wheel-smoke"
+          bilibili-crawler capabilities --json > primary.json
+          bili-comments capabilities --json > alias.json
+          python -m bili_comments capabilities --json > module.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          paths = [Path("primary.json"), Path("alias.json"), Path("module.json")]
+          payloads = []
+          for path in paths:
+              lines = path.read_text(encoding="utf-8").splitlines()
+              if len(lines) != 1:
+                  raise SystemExit(f"{path}: expected exactly one JSON line")
+              payloads.append(json.loads(lines[0]))
+          if payloads[1:] != payloads[:1] * 2:
+              raise SystemExit("installed JSON entry points returned different payloads")
+          PY
+
+      - name: Upload audited distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
