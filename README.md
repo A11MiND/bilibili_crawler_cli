@@ -1,13 +1,15 @@
 # bilibili_crawler_cli
 
-一个零第三方运行时依赖的哔哩哔哩评论命令行工具。支持一级与二级评论导出、CSV、断点续爬、登录状态校验、IP 属地字段、任务锁，以及面向 LLM/coding agent 的稳定 JSON 接口。
+一个零第三方运行时依赖的哔哩哔哩评论命令行工具。支持一级与二级评论导出、CSV、断点续爬、交互式终端进度条、登录状态校验、IP 属地字段、任务锁，以及面向 LLM/coding agent 的稳定 JSON 接口。
 
 完整安装、使用、Agent 集成、代码实现和设计说明见 [README_CN.md](./README_CN.md)。
 
 快速安装：
 
 ```bash
-python3 -m pip install .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 bilibili-crawler capabilities --json
 ```
 

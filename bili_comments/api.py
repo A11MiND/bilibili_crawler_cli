@@ -30,9 +30,11 @@ _VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 _NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 _ROOT_REPLY_URL = "https://api.bilibili.com/x/v2/reply/wbi/main"
 _CHILD_REPLY_URL = "https://api.bilibili.com/x/v2/reply/reply"
+_CHILD_DETAIL_URL = "https://api.bilibili.com/x/v2/reply/detail"
 _VIDEO_TYPE = 1
 _ROOT_PAGE_MODE = 3
 _CHILD_PAGE_SIZE = 20
+_CHILD_PAGINATION_LIMIT_MESSAGE = "max offset exceeded"
 _WBI_KEY_TTL_SECONDS = 6 * 60 * 60
 
 _BVID_RE = re.compile(r"^BV[0-9A-Za-z]{10}$", re.IGNORECASE)
@@ -183,6 +185,10 @@ class VideoUnavailableError(BilibiliAPIError):
 
 class RiskControlError(BilibiliAPIError):
     """Bilibili stopped the request due to throttling or risk control."""
+
+
+class ChildPaginationLimitError(BilibiliAPIError):
+    """The legacy child endpoint rejected its maximum page offset."""
 
 
 class TemporaryNetworkError(BilibiliError):
@@ -520,6 +526,102 @@ class BilibiliClient:
             has_more=has_more,
         )
 
+    def fetch_child_detail_page(
+        self,
+        video: VideoInfo,
+        root_id: str | int,
+        next_cursor: int,
+    ) -> CommentPage:
+        """Fetch one floor-ordered child page using the detail cursor.
+
+        This endpoint is the safe fallback when the legacy page-number endpoint
+        reaches its server-side maximum offset. Its cursor is an absolute
+        continuation position and must advance on every non-terminal page.
+        """
+
+        normalized_root = str(root_id).strip()
+        if not normalized_root.isdigit() or int(normalized_root) <= 0:
+            raise ValueError("root_id must be a positive numeric comment ID")
+        if (
+            isinstance(next_cursor, bool)
+            or not isinstance(next_cursor, int)
+            or next_cursor < 0
+        ):
+            raise ValueError("next_cursor must be a non-negative integer")
+
+        self._ensure_authentication_fresh()
+        payload = self._request_json(
+            _CHILD_DETAIL_URL,
+            {
+                "oid": video.aid,
+                "type": _VIDEO_TYPE,
+                "root": normalized_root,
+                "next": next_cursor,
+                "ps": _CHILD_PAGE_SIZE,
+            },
+            referer=video.canonical_url,
+        )
+        data = self._require_data_mapping(payload, _CHILD_DETAIL_URL)
+
+        root_raw = data.get("root")
+        if not isinstance(root_raw, Mapping):
+            raise ResponseFormatError("data.root is missing", _CHILD_DETAIL_URL)
+        returned_root = _required_identifier(
+            root_raw.get("rpid"),
+            "data.root.rpid",
+            _CHILD_DETAIL_URL,
+        )
+        if returned_root != normalized_root:
+            raise ResponseFormatError(
+                "data.root.rpid does not match the requested root",
+                _CHILD_DETAIL_URL,
+            )
+        raw_replies = root_raw.get("replies")
+        if not isinstance(raw_replies, Sequence) or isinstance(
+            raw_replies, (str, bytes, bytearray)
+        ):
+            raise ResponseFormatError(
+                "data.root.replies is not a list",
+                _CHILD_DETAIL_URL,
+            )
+        items = _map_reply_list(raw_replies, _CHILD_DETAIL_URL)
+        if any(comment.root != normalized_root for comment in items):
+            raise ResponseFormatError(
+                "child comment root does not match the requested root",
+                _CHILD_DETAIL_URL,
+            )
+
+        cursor_raw = data.get("cursor")
+        if not isinstance(cursor_raw, Mapping):
+            raise ResponseFormatError("data.cursor is missing", _CHILD_DETAIL_URL)
+        is_end = _required_bool(
+            cursor_raw.get("is_end"),
+            "data.cursor.is_end",
+            _CHILD_DETAIL_URL,
+        )
+        if is_end:
+            # Live responses reset ``cursor.next`` to zero on the final page;
+            # some response variants omit it. It is not a continuation once
+            # ``is_end`` is explicit, so neither form should block completion.
+            returned_next: int | None = None
+        else:
+            returned_next = _required_nonnegative_int(
+                cursor_raw.get("next"),
+                "data.cursor.next",
+                _CHILD_DETAIL_URL,
+            )
+            if returned_next <= next_cursor:
+                raise ResponseFormatError(
+                    "detail cursor did not advance",
+                    _CHILD_DETAIL_URL,
+                )
+
+        return CommentPage(
+            items=items,
+            next_cursor=returned_next,
+            has_more=not is_end,
+        )
+
     # SDD terminology retained as aliases for callers created before the final
     # Phase 1 method names were settled.
     def list_root_comments(
@@ -770,6 +872,12 @@ class BilibiliClient:
             return
 
         message = _optional_text(payload.get("message") or payload.get("msg"))
+        if (
+            endpoint == _CHILD_REPLY_URL
+            and code == -400
+            and message == _CHILD_PAGINATION_LIMIT_MESSAGE
+        ):
+            raise ChildPaginationLimitError(code, message, endpoint)
         error_type: type[BilibiliAPIError]
         if code in _AUTH_CODES:
             error_type = AuthenticationRequiredError
@@ -919,6 +1027,16 @@ def _required_positive_int(value: object, field: str, endpoint: str) -> int:
     return result
 
 
+def _required_nonnegative_int(
+    value: object,
+    field: str,
+    endpoint: str,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResponseFormatError(f"{field} is missing or invalid", endpoint)
+    return value
+
+
 def _required_bool(value: object, field: str, endpoint: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -973,6 +1091,7 @@ __all__ = [
     "BilibiliAPIError",
     "BilibiliClient",
     "BilibiliError",
+    "ChildPaginationLimitError",
     "InvalidVideoInput",
     "ResponseFormatError",
     "RiskControlError",

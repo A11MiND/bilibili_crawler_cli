@@ -18,7 +18,15 @@ description: "通过可恢复的命令行任务，将单个哔哩哔哩公开视
 在项目根目录安装：
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install .
+```
+
+需要独立安装到 PATH 且已安装 `uv` 时：
+
+```bash
+uv tool install . --python 3.12
 ```
 
 确认命令可用：

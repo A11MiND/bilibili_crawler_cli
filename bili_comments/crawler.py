@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from .api import BilibiliClient
+from .api import BilibiliClient, ChildPaginationLimitError
 from .models import Comment, VideoInfo
 from .storage import (
     AUTH_MODES,
@@ -169,8 +169,8 @@ class Crawler:
                     "断点中的一级评论序号与 CSV 不一致，无法安全续爬；"
                     "请使用 --restart"
                 )
-            if legacy_checkpoint:
-                self._migrate_v1_checkpoint(
+            if checkpoint.schema_version < 3:
+                self._migrate_checkpoint(
                     checkpoint,
                     auth_mode,
                     csv_store,
@@ -259,7 +259,8 @@ class Crawler:
 
                 if root.rcount > 0:
                     checkpoint.current_root_id = root_id
-                    checkpoint.sub_cursor = 1
+                    checkpoint.sub_cursor = 0
+                    checkpoint.child_strategy = "detail"
                     checkpoint.phase = "child_page"
                 else:
                     _append_unique(
@@ -268,6 +269,7 @@ class Crawler:
                     completed.add(root_id)
                     checkpoint.current_root_id = None
                     checkpoint.sub_cursor = None
+                    checkpoint.child_strategy = "page"
 
                 self._save_checkpoint(
                     checkpoint, checkpoint_store, csv_store
@@ -296,6 +298,7 @@ class Crawler:
                 checkpoint.next_main_cursor = None
                 checkpoint.current_root_id = None
                 checkpoint.sub_cursor = None
+                checkpoint.child_strategy = "page"
                 self._save_checkpoint(
                     checkpoint, checkpoint_store, csv_store
                 )
@@ -317,6 +320,7 @@ class Crawler:
             checkpoint.completed_root_ids_in_page = []
             checkpoint.current_root_id = None
             checkpoint.sub_cursor = None
+            checkpoint.child_strategy = "page"
             checkpoint.phase = "root_page"
             self._save_checkpoint(checkpoint, checkpoint_store, csv_store)
 
@@ -336,37 +340,43 @@ class Crawler:
         return requested
 
     @staticmethod
-    def _migrate_v1_checkpoint(
+    def _migrate_checkpoint(
         checkpoint: Checkpoint,
         auth_mode: str,
         csv_store: CsvStore,
     ) -> None:
-        """Upgrade a validated, read-only v1 checkpoint in memory.
+        """Upgrade a validated v1/v2 checkpoint to the detail-cursor schema.
 
         Version 1 used ``sub_cursor=None`` both for "start at page 1" and
         "the final child page is committed".  The latter is distinguishable
         because it also retained ``phase=child_page`` and ``current_root_id``;
-        migrate that state directly to root completion.
+        migrate that state directly to root completion. Any genuinely active
+        legacy child stream restarts detail pagination at cursor zero; the CSV
+        comment-ID index safely de-duplicates the replay.
         """
 
-        if checkpoint.schema_version != 1:
+        if checkpoint.schema_version not in {1, 2}:
             return
-        if csv_store.rows_written == 0:
-            migrated_auth_mode = auth_mode
-        elif csv_store.ip_location_count > 0:
-            migrated_auth_mode = "authenticated"
-            if auth_mode != migrated_auth_mode:
+        if checkpoint.schema_version == 1:
+            if csv_store.rows_written == 0:
+                migrated_auth_mode = auth_mode
+            elif csv_store.ip_location_count > 0:
+                migrated_auth_mode = "authenticated"
+                if auth_mode != migrated_auth_mode:
+                    raise CrawlStateError(
+                        "v1 断点中的 CSV 含 IP 属地，可确定原任务为登录模式；"
+                        "本次匿名模式不能混用，请使用登录模式续爬或 --restart"
+                    )
+            else:
                 raise CrawlStateError(
-                    "v1 断点中的 CSV 含 IP 属地，可确定原任务为登录模式；"
-                    "本次匿名模式不能混用，请使用登录模式续爬或 --restart"
+                    "v1 断点已有评论但没有可可靠推断登录模式的 IP 属地；"
+                    "为避免混合匿名/登录数据，请使用 --restart"
                 )
         else:
-            raise CrawlStateError(
-                "v1 断点已有评论但没有可可靠推断登录模式的 IP 属地；"
-                "为避免混合匿名/登录数据，请使用 --restart"
-            )
+            migrated_auth_mode = checkpoint.auth_mode
         if (
-            checkpoint.status == "running"
+            checkpoint.schema_version == 1
+            and checkpoint.status == "running"
             and checkpoint.phase == "child_page"
             and checkpoint.current_root_id is not None
             and checkpoint.sub_cursor is None
@@ -384,8 +394,16 @@ class Crawler:
                 checkpoint.current_root_id,
             )
             checkpoint.current_root_id = None
+            checkpoint.child_strategy = "page"
             checkpoint.phase = "root_page"
-        checkpoint.schema_version = 2
+        elif (
+            checkpoint.status == "running"
+            and checkpoint.phase == "child_page"
+            and checkpoint.current_root_id is not None
+        ):
+            checkpoint.child_strategy = "detail"
+            checkpoint.sub_cursor = 0
+        checkpoint.schema_version = 3
         checkpoint.auth_mode = migrated_auth_mode
         checkpoint.validate()
 
@@ -395,24 +413,66 @@ class Crawler:
         root_id: str,
         root_sequence: int,
         root_author: tuple[str, str],
-        start_page: object | None,
+        start_cursor: object | None,
         checkpoint: Checkpoint,
         checkpoint_store: CheckpointStore,
         csv_store: CsvStore,
     ) -> None:
-        page_no = _child_page_number(start_page)
-        seen_pages: set[int] = set()
+        strategy = checkpoint.child_strategy
+        cursor = _child_cursor(start_cursor, strategy)
+        seen_cursors: set[int] = set()
 
         while True:
-            if page_no in seen_pages:
+            if cursor in seen_cursors:
                 raise CrawlStateError(
-                    f"根评论 {root_id} 的二级评论页码重复，已停止以避免无限请求"
+                    f"根评论 {root_id} 的二级评论游标重复，已停止以避免无限请求"
                 )
-            seen_pages.add(page_no)
-            self._report(
-                f"请求一级评论 #{root_sequence} 的二级评论第 {page_no} 页"
-            )
-            page = self.client.fetch_child_page(video, root_id, page_no)
+            seen_cursors.add(cursor)
+
+            if strategy == "page":
+                self._report(
+                    f"请求一级评论 #{root_sequence} 的二级评论第 {cursor} 页"
+                )
+                try:
+                    page = self.client.fetch_child_page(
+                        video,
+                        root_id,
+                        cursor,
+                    )
+                except ChildPaginationLimitError:
+                    # The detail endpoint is floor-ordered rather than
+                    # popularity-ordered, so page offsets cannot be converted.
+                    # Persist cursor zero before issuing the first detail
+                    # request. Existing CSV rows de-duplicate the full replay.
+                    strategy = "detail"
+                    cursor = 0
+                    seen_cursors.clear()
+                    checkpoint.child_strategy = strategy
+                    checkpoint.sub_cursor = cursor
+                    checkpoint.current_root_id = root_id
+                    checkpoint.phase = "child_page"
+                    self._save_checkpoint(
+                        checkpoint,
+                        checkpoint_store,
+                        csv_store,
+                    )
+                    self._report(
+                        f"一级评论 #{root_sequence} 的旧分页达到服务端上限；"
+                        "已切换明细游标并从 next=0 安全重扫"
+                    )
+                    continue
+                progress_label = f"第 {cursor} 页"
+            else:
+                self._report(
+                    f"请求一级评论 #{root_sequence} 的二级评论明细 "
+                    f"next={cursor}"
+                )
+                page = self.client.fetch_child_detail_page(
+                    video,
+                    root_id,
+                    cursor,
+                )
+                progress_label = f"明细 next={cursor}"
 
             page_authors = {
                 str(comment.rpid): (
@@ -438,15 +498,16 @@ class Crawler:
             if page.has_more:
                 if page.next_cursor is None:
                     raise CrawlStateError(
-                        f"根评论 {root_id} 仍有二级评论，但没有返回下一页码"
+                        f"根评论 {root_id} 仍有二级评论，但没有返回下一游标"
                     )
-                next_page = _child_page_number(page.next_cursor)
-                if next_page == page_no:
+                next_cursor = _child_cursor(page.next_cursor, strategy)
+                if next_cursor <= cursor:
                     raise CrawlStateError(
-                        f"根评论 {root_id} 返回了相同二级评论页码"
+                        f"根评论 {root_id} 的二级评论游标没有前进"
                     )
-                checkpoint.sub_cursor = next_page
+                checkpoint.sub_cursor = next_cursor
                 checkpoint.current_root_id = root_id
+                checkpoint.child_strategy = strategy
                 checkpoint.phase = "child_page"
             else:
                 _append_unique(
@@ -455,17 +516,18 @@ class Crawler:
                 )
                 checkpoint.current_root_id = None
                 checkpoint.sub_cursor = None
+                checkpoint.child_strategy = "page"
                 checkpoint.phase = "root_page"
 
             self._save_checkpoint(checkpoint, checkpoint_store, csv_store)
             self._report(
-                f"二级评论第 {page_no} 页：新增 {written} 条，"
+                f"二级评论{progress_label}：新增 {written} 条，"
                 f"累计 {len(csv_store.seen_ids)} 条"
             )
 
             if not page.has_more:
                 return
-            page_no = _child_page_number(page.next_cursor)
+            cursor = _child_cursor(page.next_cursor, strategy)
 
     @staticmethod
     def _save_checkpoint(
@@ -597,6 +659,32 @@ def _child_page_number(value: object | None) -> int:
     if page_no < 1:
         raise CrawlStateError(f"二级评论页码必须大于 0: {page_no}")
     return page_no
+
+
+def _child_detail_cursor(value: object | None) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise CrawlStateError("二级评论明细游标格式无效")
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CrawlStateError(
+            f"二级评论明细游标格式无效: {value!r}"
+        ) from exc
+    if cursor < 0 or str(value).strip() != str(cursor):
+        raise CrawlStateError(
+            f"二级评论明细游标必须是非负整数: {value!r}"
+        )
+    return cursor
+
+
+def _child_cursor(value: object | None, strategy: str) -> int:
+    if strategy == "page":
+        return _child_page_number(value)
+    if strategy == "detail":
+        return _child_detail_cursor(value)
+    raise CrawlStateError(f"未知的二级评论抓取策略: {strategy!r}")
 
 
 def _cursor_key(cursor: object | None) -> str:

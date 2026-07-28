@@ -6,6 +6,7 @@ from .api import (
     BilibiliAPIError,
     BilibiliClient,
     BilibiliError,
+    ChildPaginationLimitError,
     InvalidVideoInput,
     ResponseFormatError,
     RiskControlError,
@@ -24,6 +25,7 @@ __all__ = [
     "BilibiliAPIError",
     "BilibiliClient",
     "BilibiliError",
+    "ChildPaginationLimitError",
     "Comment",
     "CommentPage",
     "Cursor",
@@ -38,4 +40,4 @@ __all__ = [
     "sign_wbi",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

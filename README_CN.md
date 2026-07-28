@@ -12,6 +12,7 @@
 - 解析视频标识和基础信息。
 - 抓取当前访问身份可见的全部一级评论。
 - 抓取一级评论下当前可见的二级评论。
+- 使用明细游标抓取大型二级评论区，不受旧页码接口最大偏移限制。
 - 输出 UTF-8 BOM 编码的 CSV。
 - 每批写入后持久化断点。
 - 重复运行同一任务时自动续爬。
@@ -22,6 +23,7 @@
 - 联网校验 Cookie，失效 Cookie 不会静默降级为匿名抓取。
 - 提取接口返回的 IP 属地；接口未返回时保留空值。
 - 提供人类可读输出和稳定的单对象 JSON 输出。
+- 在交互式终端显示单行进度条、计数、速率和耗时。
 - 提供 `status`、`capabilities` 和 `auth` 命令。
 - 随 Python 包安装 Agent 可读的 `SKILL.md`。
 - 运行时只使用 Python 标准库。
@@ -58,7 +60,9 @@ python3 --version
 在项目根目录执行：
 
 ```bash
-python3 -m pip install .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 ```
 
 安装后检查命令：
@@ -68,15 +72,30 @@ bilibili-crawler --help
 bilibili-crawler capabilities --json
 ```
 
-### 3.2 开发模式安装
+虚拟环境隔离 CLI 与系统 Python，兼容启用 PEP 668 保护的 Homebrew Python。
+
+### 3.2 安装为全局可用 CLI
+
+已安装 `uv` 时，可以将工具安装到独立环境并加入 PATH：
+
+```bash
+uv tool install . --python 3.12
+bilibili-crawler capabilities --json
+```
+
+`uv` 只负责安装隔离，不是本项目的运行时依赖。
+
+### 3.3 开发模式安装
 
 需要直接修改源代码时使用：
 
 ```bash
-python3 -m pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
-### 3.3 不安装直接运行
+### 3.4 不安装直接运行
 
 在项目根目录执行：
 
@@ -110,7 +129,13 @@ bilibili-crawler crawl --anonymous
 
 未提供视频参数且未启用 `--json` 时，程序会提示输入 URL 或 BV 号。
 
-### 4.3 登录抓取
+### 4.3 终端进度
+
+人类模式下，如果 stderr 是交互式终端，抓取过程会原地显示轻量进度行：已写入数量、一级/二级评论数量、速率、耗时，以及基于视频页面评论数的近似百分比。页面总数不可用时只显示计数。
+
+stderr 不是 TTY 时退化为普通逐行日志，不输出 ANSI 控制符。`--json` 模式仍保证 stdout 只有最终单个 JSON envelope，进度只写入 stderr，且不使用动态终端控制。正常结束、错误或中断时都会清理临时进度行。
+
+### 4.4 登录抓取
 
 先保存 Cookie：
 
@@ -140,7 +165,7 @@ bilibili-crawler crawl "BVxxxxxxxxxx"
 
 程序会在访问视频和评论接口前校验登录状态。Cookie 失效或过期时返回认证错误，不会继续执行匿名抓取。
 
-### 4.4 临时 Cookie 来源
+### 4.5 临时 Cookie 来源
 
 从受限权限文件读取：
 
@@ -164,7 +189,7 @@ bilibili-crawler crawl "BVxxxxxxxxxx"
 
 不要把 Cookie 直接写入命令参数。命令参数可能进入 Shell 历史、进程列表或审计日志。
 
-### 4.5 获取 Cookie 的边界
+### 4.6 获取 Cookie 的边界
 
 本工具不读取浏览器数据库，不控制浏览器，也不自动登录。需要登录数据时，用户应从本人已登录且有权使用的会话中取得请求头 Cookie，并通过隐藏输入、环境变量或权限受限文件提供。
 
@@ -205,7 +230,14 @@ state/{BVID}.lock
 - CSV 与 checkpoint 不一致：停止并返回本地状态错误。
 - 同一视频已有进程持有锁：第二个进程停止，不并发写入。
 
-旧版 schema v1 任务按以下规则迁移：
+当前 checkpoint schema 为 v3。v3 增加 `child_strategy`：
+
+- `page`：旧页码分页，仅用于兼容旧断点。
+- `detail`：明细游标分页，`sub_cursor` 可从 0 开始。
+
+schema v2 保留原 `auth_mode` 并自动升级到 v3。v1/v2 如果停在未完成的二级评论流，会从明细游标 `next=0` 重扫，并按 CSV 中的评论 ID 去重。页码和明细游标语义不同，程序不会把旧页码直接转换成明细游标。
+
+旧版 schema v1 的认证模式按以下规则迁移：
 
 - 只有表头、尚未写入评论：可采用本次选择的认证模式并升级。
 - 已有数据且至少一行包含 IP 属地：可推断旧任务为登录模式；匿名恢复会被拒绝。
@@ -247,6 +279,7 @@ bilibili-crawler status "BVxxxxxxxxxx" --json
 - 一级、二级和 IP 属地行数。
 - CSV 与 checkpoint 是否成对。
 - 抓取时使用的认证模式。
+- 当前二级评论策略、当前根评论和二级游标。
 - CSV 与 checkpoint 的绝对路径。
 
 ## 8. CSV 数据格式
@@ -553,6 +586,7 @@ bilibili_crawler_cli/
 │       └── SKILL.md
 ├── .gitignore
 ├── LICENSE
+├── MANIFEST.in
 ├── README.md
 ├── README_CN.md
 └── pyproject.toml
@@ -681,9 +715,9 @@ CLI 在登录抓取前调用此方法。抓取期间，一级和二级翻页也�
 
 将用户输入转换为 `VideoInfo`。视频不存在、下架或无权访问时映射为明确业务异常，不创建虚假的空结果。
 
-#### `fetch_root_page()` 与 `fetch_child_page()`
+#### `fetch_root_page()`、`fetch_child_page()` 与 `fetch_child_detail_page()`
 
-两个方法负责：
+这些方法负责：
 
 - 构造当前接口参数。
 - 添加 WBI 签名。
@@ -693,7 +727,11 @@ CLI 在登录抓取前调用此方法。抓取期间，一级和二级翻页也�
 
 一级响应必须存在有效 cursor，并明确提供 `is_end`。空 `data` 或缺少结束标志不会被当作零评论或最后一页。
 
-二级接口返回的页码如果与请求页码不一致，程序停止，不猜测下一页。继续执行可能造成静默漏抓或无限循环。
+新任务的二级评论默认使用明细游标接口。`next` 是服务端提供的不透明续传位置，可能因隐藏或删除评论而跳跃，程序必须使用响应中的 `cursor.next`，不能按页大小自行累加。末页以 `cursor.is_end=true` 为准，此时 `cursor.next` 可以为 0 或缺失。
+
+旧页码接口仅用于兼容已有断点。该接口在大型二级评论区达到最大偏移后可能返回 `-400 max offset exceeded`。程序只对这一精确响应切换到明细游标，并在第一次明细请求前原子保存 `child_strategy=detail` 和 `sub_cursor=0`。两个接口的排序和游标语义不同，因此切换后从头重扫，依靠 CSV 评论 ID 去重。
+
+旧二级接口返回的页码如果与请求页码不一致，程序停止，不猜测下一页。继续执行可能造成静默漏抓或无限循环。
 
 #### `_request_json()`
 
@@ -761,10 +799,11 @@ CLI 在登录抓取前调用此方法。抓取期间，一级和二级翻页也�
 
 Checkpoint 是带交叉字段校验的状态对象。它检查：
 
-- schema 版本。
+- schema 版本；当前写入 v3，并严格兼容读取 v1、v2。
 - BVID 和 AID。
 - `status` 与 `phase` 组合。
 - 主游标、二级游标和当前根评论之间的关系。
+- 二级评论策略与游标取值范围。
 - 行数、已提交字节数和下一一级序号。
 - 当前认证模式。
 
@@ -832,16 +871,18 @@ Checkpoint 是带交叉字段校验的状态对象。它检查：
 
 #### `_crawl_children()`
 
-每个二级页是一个提交单元：
+每个二级游标页是一个提交单元：
 
-1. 请求指定根评论和当前页。
+1. 按 checkpoint 中的策略请求指定根评论和当前页码或明细游标。
 2. 解析全部二级评论。
 3. 补全有可靠父评论证据的直接回复者。
 4. 批量去重并写入 CSV。
-5. 更新二级页游标。
+5. 使用接口返回值更新二级游标。
 6. 最后一页在同一次 checkpoint 保存中清空当前根评论状态。
 
-最后一步避免“最后一页数据已提交，但根评论完成状态未提交”导致恢复后从二级第一页重新请求。
+旧页码接口达到精确的最大偏移错误时，程序先把切换到 `detail/0` 的状态持久化，再发起明细请求。恢复时会从已提交的明细游标继续；从旧状态重扫产生的重复评论由 CSV ID 索引过滤。
+
+最后一步避免“最后一页数据已提交，但根评论完成状态未提交”导致恢复后重新请求该二级评论流。
 
 #### `_root_row()` 与 `_child_row()`
 
@@ -883,9 +924,9 @@ API 层不接触中文表头，存储层不理解评论业务关系，转换集�
 
 所有 JSON 命令通过同一函数输出固定顶层字段。`ensure_ascii=False` 保留中文，紧凑编码保证一行一个对象，便于进程调用方解析。
 
-#### `_progress()`
+#### `_CrawlProgress` 与 `_progress()`
 
-人类模式把进度写到 stdout。JSON 模式把进度写到 stderr，stdout 只保留最终 envelope。
+`_CrawlProgress` 在人类 TTY 中维护单行计数、近似百分比、速率和耗时；非 TTY 时输出无 ANSI 的普通日志。JSON 模式的进度始终只写入 stderr，stdout 只保留最终 envelope。退出路径会先清理动态行，再输出总结或错误。
 
 #### 错误分类
 
@@ -904,6 +945,16 @@ Phase 1 的网络、CSV、JSON、参数解析、锁和原子文件操作都能�
 ### 13.3 串行请求
 
 评论抓取是验证型功能。串行请求更容易控制频率、定位断点和保持父子关系，不引入并发分页排序与共享状态问题。
+
+当前版本不实现高并发或 MQ。单个视频的一级评论游标必须串行推进；后续版本只适合并行抓取同一一级页内不同根评论的二级评论流。推荐设计如下：
+
+- 使用标准库 `ThreadPoolExecutor` 执行有限并发请求。
+- worker 只抓取和解析；单一写入线程串行执行 CSV `append + fsync` 和 checkpoint 原子替换。
+- 所有 worker 共享同一个请求限速器、并发上限、风控停止信号和认证刷新状态。
+- checkpoint schema v4 记录每个根评论的游标、状态和提交结果；当前页内所有根评论持久化完成后，才能推进一级游标。
+- 单进程使用 `queue.Queue` 即可；单机持久化多视频任务使用标准库 `sqlite3`。
+- 只有多进程或多主机部署才考虑 Redis。RabbitMQ 仅适用于需要消息确认、重投、路由和死信队列的服务化场景。
+- 默认 worker 保持 1，可选 2–3，硬上限 4。并发不会解除账号或 IP 维度的上游限制。
 
 ### 13.4 每页提交
 

@@ -9,9 +9,13 @@ import inspect
 import io
 import json
 import os
+import re
+import shutil
 import stat
 import sys
 import tempfile
+import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
@@ -76,6 +80,150 @@ class CliUsageError(ValueError):
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message, self.format_usage())
+
+
+class _CrawlProgress:
+    """Render crawler progress without changing the crawler callback contract."""
+
+    _START_PATTERN = re.compile(r"已保存\s+(\d+)\s+条")
+    _ROOT_PATTERN = re.compile(
+        r"一级评论\s+#(\d+)\s+.*（(已写入|已存在)）"
+    )
+    _CHILD_PATTERN = re.compile(
+        r"二级评论(?:第\s+\d+\s+页|明细\s+next=\d+)："
+        r"新增\s+(\d+)\s+条，累计\s+(\d+)\s+条"
+    )
+    _PERSISTENT_PREFIXES = ("已备份旧任务", "检测到只有标准表头")
+
+    def __init__(
+        self,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+        json_mode: bool,
+        expected_total: int | None,
+        initial_written: int = 0,
+        initial_root: int = 0,
+        initial_child: int = 0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.json_mode = json_mode
+        self.expected_total = (
+            expected_total
+            if isinstance(expected_total, int) and expected_total > 0
+            else None
+        )
+        self.written = max(0, initial_written)
+        self.root_count = max(0, initial_root)
+        self.child_count = max(0, initial_child)
+        self.initial_written = self.written
+        self._clock = clock
+        self._started_at = clock()
+        self._interactive = not json_mode and _stream_is_tty(stderr)
+        self._stream = stderr if self._interactive or json_mode else stdout
+        self._active = False
+        self._closed = False
+        self._stage = "准备抓取"
+
+    def update(self, message: str) -> None:
+        """Consume one existing crawler progress message."""
+
+        if self._closed:
+            return
+        self._stage = _single_line(message)
+        self._update_counts(message)
+        if not self._interactive:
+            print(self._stage, file=self._stream)
+            return
+
+        if message.startswith(self._PERSISTENT_PREFIXES):
+            self._clear_line()
+            print(self._stage, file=self._stream)
+        self._render()
+
+    def finish(self, result: CrawlResult) -> None:
+        """Apply exact final counts before clearing the transient line."""
+
+        self.written = result.total_count
+        self.root_count = result.root_count
+        self.child_count = result.child_count
+        self._stage = "抓取完成"
+        try:
+            if self._interactive and self._active:
+                self._render()
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Remove an active terminal line; safe to call more than once."""
+
+        if self._closed:
+            return
+        self._clear_line()
+        self._closed = True
+
+    def _update_counts(self, message: str) -> None:
+        start_match = self._START_PATTERN.search(message)
+        if start_match:
+            self.written = max(self.written, int(start_match.group(1)))
+
+        root_match = self._ROOT_PATTERN.search(message)
+        if root_match:
+            sequence = int(root_match.group(1))
+            disposition = root_match.group(2)
+            self.root_count = max(self.root_count, sequence)
+            if disposition == "已写入":
+                self.written += 1
+            self.child_count = max(
+                self.child_count,
+                self.written - self.root_count,
+            )
+
+        child_match = self._CHILD_PATTERN.search(message)
+        if child_match:
+            cumulative = int(child_match.group(2))
+            self.written = max(self.written, cumulative)
+            self.child_count = max(
+                self.child_count,
+                self.written - self.root_count,
+            )
+
+    def _render(self) -> None:
+        elapsed = max(0.0, self._clock() - self._started_at)
+        added = max(0, self.written - self.initial_written)
+        rate = added / elapsed if elapsed > 0 else 0.0
+        counts = f"已写入 {self.written}"
+        if self.expected_total is None:
+            progress = "进度 --"
+        else:
+            ratio = min(1.0, self.written / self.expected_total)
+            counts += f"/{self.expected_total}"
+            bar_width = 10
+            filled = min(bar_width, int(ratio * bar_width))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            progress = f"[{bar}] ≈{ratio * 100:.1f}%"
+        line = (
+            f"{progress} | {counts}"
+            f" | 一级 {self.root_count} 二级 {self.child_count}"
+            f" | {rate:.1f}条/s | 耗时 {_format_elapsed(elapsed)}"
+        )
+        width = _terminal_columns(self._stream)
+        if width >= 120:
+            line += f" | {self._stage}"
+        line = _truncate_display_width(line, max(0, width - 1))
+        self._stream.write("\r\x1b[2K")
+        self._stream.write(line)
+        self._stream.flush()
+        self._active = True
+
+    def _clear_line(self) -> None:
+        if not self._interactive or not self._active:
+            return
+        self._stream.write("\r\x1b[2K")
+        self._stream.flush()
+        self._active = False
 
 
 def default_cookie_path() -> Path:
@@ -570,6 +718,7 @@ def run_crawl(
     make_client = BilibiliClient if client_factory is None else client_factory
     make_crawler = Crawler if crawler_factory is None else crawler_factory
     crawler_started = False
+    progress_display: _CrawlProgress | None = None
 
     try:
         client = make_client(cookie=cookie)
@@ -589,14 +738,23 @@ def run_crawl(
             err,
             json_mode,
         )
+        initial_written, initial_root, initial_child = (
+            (0, 0, 0)
+            if args.restart
+            else _existing_progress_counts(video.bvid)
+        )
+        progress_display = _CrawlProgress(
+            stdout=out,
+            stderr=err,
+            json_mode=json_mode,
+            expected_total=video.reply_count,
+            initial_written=initial_written,
+            initial_root=initial_root,
+            initial_child=initial_child,
+        )
         crawler = make_crawler(
             client,
-            progress=lambda message: _progress(
-                message,
-                out,
-                err,
-                json_mode,
-            ),
+            progress=progress_display.update,
         )
         crawler_started = True
         result = _run_crawler(
@@ -606,6 +764,7 @@ def run_crawl(
             auth_mode=auth_mode,
         )
     except KeyboardInterrupt:
+        _close_progress(progress_display)
         message = (
             "已中断；已成功提交的 CSV 和断点均已保留，"
             "重新运行同一命令即可续爬。"
@@ -622,6 +781,7 @@ def run_crawl(
             json_mode=json_mode,
         )
     except AuthenticationRequiredError as exc:
+        _close_progress(progress_display)
         return _fail(
             "crawl",
             EXIT_AUTH,
@@ -633,6 +793,7 @@ def run_crawl(
             human_prefix="登录认证失败",
         )
     except (AccessDeniedError, VideoUnavailableError) as exc:
+        _close_progress(progress_display)
         return _fail(
             "crawl",
             EXIT_ACCESS,
@@ -644,6 +805,7 @@ def run_crawl(
             human_prefix="视频不可访问",
         )
     except (TemporaryNetworkError, RiskControlError) as exc:
+        _close_progress(progress_display)
         message = str(exc)
         if crawler_started:
             message += "；断点可能已保留，稍后运行同一命令即可续爬"
@@ -663,6 +825,7 @@ def run_crawl(
         StorageError,
         OSError,
     ) as exc:
+        _close_progress(progress_display)
         return _fail(
             "crawl",
             EXIT_LOCAL,
@@ -674,6 +837,7 @@ def run_crawl(
             human_prefix="本地状态或数据错误",
         )
     except (BilibiliAPIError, BilibiliError) as exc:
+        _close_progress(progress_display)
         return _fail(
             "crawl",
             EXIT_UPSTREAM,
@@ -684,7 +848,12 @@ def run_crawl(
             json_mode=json_mode,
             human_prefix="Bilibili 接口错误",
         )
+    except BaseException:
+        _close_progress(progress_display)
+        raise
 
+    if progress_display is not None:
+        progress_display.finish(result)
     data = _crawl_result_data(result, auth_mode=auth_mode)
     if json_mode:
         _emit_envelope(out, "crawl", EXIT_OK, data=data)
@@ -786,6 +955,9 @@ def run_status(
         "rows_written": checkpoint.rows_written,
         "committed_bytes": checkpoint.committed_bytes,
         "auth_mode": getattr(checkpoint, "auth_mode", None),
+        "child_strategy": getattr(checkpoint, "child_strategy", "page"),
+        "current_root_id": checkpoint.current_root_id,
+        "sub_cursor": checkpoint.sub_cursor,
         **csv_data,
     }
     if json_mode:
@@ -797,6 +969,13 @@ def run_status(
             f"IP 属地 {csv_data['ip_location_count']} 行",
             file=out,
         )
+        if checkpoint.phase == "child_page":
+            print(
+                "二级评论："
+                f"{getattr(checkpoint, 'child_strategy', 'page')} "
+                f"cursor={checkpoint.sub_cursor}",
+                file=out,
+            )
         print(f"CSV：{csv_path.resolve()}", file=out)
         print(f"断点：{state_path.resolve()}", file=out)
     return EXIT_OK
@@ -1058,6 +1237,30 @@ def _read_committed_csv_status(
     }
 
 
+def _existing_progress_counts(bvid: str) -> tuple[int, int, int]:
+    """Read prior committed counts without mutating recovery state."""
+
+    csv_path = Path("output") / f"{bvid}.csv"
+    state_path = Path("state") / f"{bvid}.json"
+    if not csv_path.is_file() or not state_path.is_file():
+        return (0, 0, 0)
+    try:
+        checkpoint = CheckpointStore("state", bvid).load()
+        if checkpoint is None:
+            return (0, 0, 0)
+        counts = _read_committed_csv_status(
+            csv_path,
+            checkpoint.committed_bytes,
+        )
+    except (StorageError, OSError, UnicodeError, csv.Error):
+        return (0, 0, 0)
+    return (
+        counts["row_count"],
+        counts["root_count"],
+        counts["child_count"],
+    )
+
+
 def _crawl_result_data(
     result: CrawlResult,
     *,
@@ -1209,6 +1412,86 @@ def _progress(
     json_mode: bool,
 ) -> None:
     print(message, file=err if json_mode else out)
+
+
+def _close_progress(progress: _CrawlProgress | None) -> None:
+    if progress is not None:
+        progress.close()
+
+
+def _stream_is_tty(stream: TextIO) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _terminal_columns(stream: TextIO) -> int:
+    try:
+        return os.get_terminal_size(stream.fileno()).columns
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        return shutil.get_terminal_size(fallback=(120, 24)).columns
+
+
+def _display_width(value: str) -> int:
+    """Return terminal cell width for printable text using the stdlib."""
+
+    width = 0
+    for character in value:
+        if (
+            not character.isprintable()
+            or unicodedata.combining(character)
+            or unicodedata.category(character) in {"Mn", "Me", "Cf"}
+        ):
+            continue
+        width += (
+            2
+            if unicodedata.east_asian_width(character) in {"W", "F"}
+            else 1
+        )
+    return width
+
+
+def _truncate_display_width(value: str, maximum: int) -> str:
+    """Truncate text without exceeding a terminal-cell budget."""
+
+    limit = max(0, maximum)
+    if _display_width(value) <= limit:
+        return value
+    if limit == 0:
+        return ""
+
+    marker = "…"
+    marker_width = _display_width(marker)
+    if marker_width > limit:
+        return ""
+
+    budget = limit - marker_width
+    used = 0
+    result: list[str] = []
+    for character in value:
+        character_width = _display_width(character)
+        if used + character_width > budget:
+            break
+        result.append(character)
+        used += character_width
+    return "".join(result) + marker
+
+
+def _single_line(value: str) -> str:
+    return " ".join(
+        "".join(character if character.isprintable() else " " for character in value)
+        .split()
+    )
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _print_summary(result: CrawlResult, out: TextIO) -> None:

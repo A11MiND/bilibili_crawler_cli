@@ -171,6 +171,7 @@ _EXCEL_TEXT_COLUMNS = frozenset(
     }
 )
 AUTH_MODES = frozenset({"anonymous", "authenticated"})
+CHILD_STRATEGIES = frozenset({"page", "detail"})
 
 
 def escape_excel_text(value: object) -> str:
@@ -388,6 +389,7 @@ class CsvStore:
                 output.write(_CSV_HEADER_BYTES)
                 output.flush()
                 os.fsync(output.fileno())
+            _fsync_directory(self.path.parent)
         except FileExistsError:
             return
         except OSError as exc:
@@ -650,7 +652,7 @@ class Checkpoint:
 
     bvid: str
     aid: int
-    schema_version: int = 2
+    schema_version: int = 3
     auth_mode: str | None = "anonymous"
     status: str = "running"
     phase: str = "root_page"
@@ -659,6 +661,7 @@ class Checkpoint:
     completed_root_ids_in_page: list[str] = field(default_factory=list)
     current_root_id: str | None = None
     sub_cursor: object | None = None
+    child_strategy: str = "page"
     next_root_sequence: int = 1
     rows_written: int = 0
     committed_bytes: int = 0
@@ -682,14 +685,17 @@ class Checkpoint:
             "committed_bytes": self.committed_bytes,
             "updated_at": self.updated_at,
         }
-        if self.schema_version == 2:
+        if self.schema_version in {2, 3}:
             value["auth_mode"] = self.auth_mode
+        if self.schema_version == 3:
+            value["child_strategy"] = self.child_strategy
         return value
 
     def validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version not in {
             1,
             2,
+            3,
         }:
             raise CheckpointError(
                 f"unsupported checkpoint schema_version: {self.schema_version}"
@@ -704,6 +710,15 @@ class Checkpoint:
         elif self.auth_mode not in AUTH_MODES:
             raise CheckpointError(
                 f"invalid checkpoint auth_mode: {self.auth_mode!r}"
+            )
+        if self.child_strategy not in CHILD_STRATEGIES:
+            raise CheckpointError(
+                f"invalid checkpoint child_strategy: {self.child_strategy!r}"
+            )
+        if self.schema_version in {1, 2} and self.child_strategy != "page":
+            raise CheckpointError(
+                f"schema version {self.schema_version} checkpoint must use "
+                "child_strategy='page'"
             )
         if self.status not in {"running", "complete"}:
             raise CheckpointError(f"invalid checkpoint status: {self.status!r}")
@@ -730,11 +745,18 @@ class Checkpoint:
                 "current_root_id must be a non-empty string or null"
             )
         if self.sub_cursor is not None:
-            _exact_positive_int(
-                self.sub_cursor,
-                "sub_cursor",
-                CheckpointError,
-            )
+            if self.child_strategy == "detail":
+                _exact_non_negative_int(
+                    self.sub_cursor,
+                    "sub_cursor",
+                    CheckpointError,
+                )
+            else:
+                _exact_positive_int(
+                    self.sub_cursor,
+                    "sub_cursor",
+                    CheckpointError,
+                )
         _exact_positive_int(
             self.next_root_sequence,
             "next_root_sequence",
@@ -762,6 +784,10 @@ class Checkpoint:
                 raise CheckpointError(
                     "complete checkpoint cannot retain child pagination state"
                 )
+            if self.child_strategy != "page":
+                raise CheckpointError(
+                    "complete checkpoint must reset child_strategy='page'"
+                )
             if self.next_main_cursor is not None:
                 raise CheckpointError(
                     "complete checkpoint cannot retain next_main_cursor"
@@ -776,13 +802,18 @@ class Checkpoint:
                     raise CheckpointError(
                         "root_page checkpoint cannot retain child pagination state"
                     )
+                if self.child_strategy != "page":
+                    raise CheckpointError(
+                        "root_page checkpoint must reset child_strategy='page'"
+                    )
             elif self.current_root_id is None:
                 raise CheckpointError(
                     "child_page checkpoint must identify current_root_id"
                 )
             elif self.sub_cursor is None and self.schema_version != 1:
                 raise CheckpointError(
-                    "schema version 2 child_page checkpoint must identify "
+                    f"schema version {self.schema_version} child_page checkpoint "
+                    "must identify "
                     "the next child page"
                 )
 
@@ -808,9 +839,15 @@ class Checkpoint:
         if schema_version == 1:
             expected = common_fields
             auth_mode: str | None = None
+            child_strategy = "page"
         elif schema_version == 2:
             expected = common_fields | {"auth_mode"}
             auth_mode = value.get("auth_mode")
+            child_strategy = "page"
+        elif schema_version == 3:
+            expected = common_fields | {"auth_mode", "child_strategy"}
+            auth_mode = value.get("auth_mode")
+            child_strategy = value.get("child_strategy")
         else:
             raise CheckpointError(
                 f"unsupported checkpoint schema_version: {schema_version}"
@@ -823,6 +860,7 @@ class Checkpoint:
         checkpoint = cls(
             schema_version=schema_version,
             auth_mode=auth_mode,
+            child_strategy=child_strategy,
             bvid=value["bvid"],
             aid=value["aid"],
             status=value["status"],
@@ -904,7 +942,7 @@ class CheckpointStore:
         if checkpoint.schema_version == 1:
             raise CheckpointError(
                 "schema version 1 checkpoints are read-only; migrate to "
-                "schema version 2 before saving"
+                "schema version 3 before saving"
             )
         checkpoint.updated_at = datetime.now().astimezone().isoformat(
             timespec="seconds"
@@ -974,14 +1012,29 @@ def backup_for_restart(
             raise StorageError(f"backup already exists: {destination}")
 
     moved: list[tuple[Path, Path]] = []
+    directories = sorted(
+        {
+            path.parent
+            for pair in zip(sources, destinations, strict=True)
+            for path in pair
+        },
+        key=os.fspath,
+    )
     try:
         for source, destination in zip(sources, destinations, strict=True):
             os.replace(source, destination)
             moved.append((source, destination))
+        for directory in directories:
+            _fsync_directory(directory)
     except OSError as exc:
         for source, destination in reversed(moved):
             try:
                 os.replace(destination, source)
+            except OSError:
+                pass
+        for directory in directories:
+            try:
+                _fsync_directory(directory)
             except OSError:
                 pass
         raise StorageError("failed to back up files for restart") from exc
